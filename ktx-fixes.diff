@@ -1,0 +1,212 @@
+diff --git a/packages/cli/src/context/scan/enrichment-state.ts b/packages/cli/src/context/scan/enrichment-state.ts
+index 84b6224d..f6b38cad 100644
+--- a/packages/cli/src/context/scan/enrichment-state.ts
++++ b/packages/cli/src/context/scan/enrichment-state.ts
+@@ -1,6 +1,12 @@
+ import { stableContentHash } from '../cache/content-result-cache.js';
+ import type { KtxScanRelationshipConfig } from '../project/config.js';
+-import type { KtxScanEnrichmentStage, KtxScanEnrichmentStateSummary, KtxScanMode, KtxSchemaSnapshot } from './types.js';
++import type {
++  KtxScanEnrichmentStage,
++  KtxScanEnrichmentStateSummary,
++  KtxScanMode,
++  KtxSchemaSnapshot,
++  KtxSchemaTable,
++} from './types.js';
+ 
+ /**
+  * Canonical enrichment-stage registry. The `--stages` CLI parser validates
+@@ -99,13 +105,26 @@ export interface KtxRelationshipsStageHashInput {
+   llmIdentity: KtxScanLlmIdentity;
+ }
+ 
++/**
++ * [fix bug1] Schema-identifying view of a snapshot for the enrichment-stage
++ * hashes. Excludes `extractedAt` — a per-scan wall-clock timestamp set fresh on
++ * every introspection — so an unchanged schema keeps a stable hash across
++ * re-scans (the timestamp otherwise re-keys every stage and forces a full
++ * LLM re-generation). Mirrors `stableLiveDatabaseHashContent` in
++ * local-stage-ingest.ts, which already strips it for the ingest work-unit hash.
++ */
++function stableSnapshotHashInput(snapshot: KtxSchemaSnapshot): Omit<KtxSchemaSnapshot, 'extractedAt'> {
++  const { extractedAt: _extractedAt, ...stable } = snapshot;
++  return stable;
++}
++
+ export function computeKtxDescriptionsStageHash(input: KtxDescriptionsStageHashInput): string {
+-  return stableContentHash({ snapshot: input.snapshot, llmIdentity: input.llmIdentity });
++  return stableContentHash({ snapshot: stableSnapshotHashInput(input.snapshot), llmIdentity: input.llmIdentity });
+ }
+ 
+ export function computeKtxEmbeddingsStageHash(input: KtxEmbeddingsStageHashInput): string {
+   return stableContentHash({
+-    snapshot: input.snapshot,
++    snapshot: stableSnapshotHashInput(input.snapshot),
+     embeddingIdentity: input.embeddingIdentity,
+     descriptionDigest: input.descriptionDigest,
+   });
+@@ -113,12 +132,26 @@ export function computeKtxEmbeddingsStageHash(input: KtxEmbeddingsStageHashInput
+ 
+ export function computeKtxRelationshipsStageHash(input: KtxRelationshipsStageHashInput): string {
+   return stableContentHash({
+-    snapshot: input.snapshot,
++    snapshot: stableSnapshotHashInput(input.snapshot),
+     relationshipSettings: input.relationshipSettings,
+     llmIdentity: input.llmIdentity,
+   });
+ }
+ 
++/**
++ * [fix bug2] Per-table description cache key. A table's AI description depends
++ * only on that table's own structure and the description LLM identity — never on
++ * which other tables are in the batch. Keying resume per table (instead of
++ * gating the whole batch on {@link computeKtxDescriptionsStageHash}) lets an
++ * added/removed table reuse every unchanged table's description.
++ */
++export function computeKtxTableDescriptionHash(input: {
++  table: KtxSchemaTable;
++  llmIdentity: KtxScanLlmIdentity;
++}): string {
++  return stableContentHash({ table: input.table, llmIdentity: input.llmIdentity });
++}
++
+ /**
+  * Content digest of the resolved per-column description text the embeddings
+  * stage consumes. Folding it into the embeddings hash content-addresses
+diff --git a/packages/cli/src/context/scan/local-enrichment-artifacts.ts b/packages/cli/src/context/scan/local-enrichment-artifacts.ts
+index fa18777a..4488840f 100644
+--- a/packages/cli/src/context/scan/local-enrichment-artifacts.ts
++++ b/packages/cli/src/context/scan/local-enrichment-artifacts.ts
+@@ -338,16 +338,25 @@ function descriptionsProgressPath(connectionId: string): string {
+ interface DescriptionsProgressRecord {
+   inputHash: string;
+   descriptions: LocalDescriptionUpdates;
++  /** [fix bug2] Per-table hash (structure + llmIdentity) keyed by tableRefKey. */
++  tableHashes?: Record<string, string>;
++}
++
++/** [fix bug2] Prior descriptions plus their per-table hashes; the caller recovers per table. */
++export interface KtxScanDescriptionResumeLoad {
++  descriptions: LocalDescriptionUpdates;
++  tableHashes: Record<string, string>;
+ }
+ 
+ export interface KtxScanDescriptionResumeStore {
+-  /** Prior enriched descriptions when the durable record matches `inputHash`, else null. */
+-  load(inputHash: string): Promise<LocalDescriptionUpdates | null>;
++  /** The whole prior record (descriptions + per-table hashes), or null when none exists. */
++  load(): Promise<KtxScanDescriptionResumeLoad | null>;
+   /** Persist the descriptions so far + the manifest shards that gained a table this batch. */
+   flush(input: {
+     inputHash: string;
+     snapshot: KtxSchemaSnapshot;
+     descriptionUpdates: LocalDescriptionUpdates;
++    tableHashes: Record<string, string>;
+     changedTableNames: ReadonlySet<string>;
+   }): Promise<void>;
+ }
+@@ -360,7 +369,7 @@ export function createKtxScanDescriptionResumeStore(deps: {
+ }): KtxScanDescriptionResumeStore {
+   const path = descriptionsProgressPath(deps.connectionId);
+   return {
+-    async load(inputHash) {
++    async load() {
+       let content: string;
+       try {
+         ({ content } = await deps.project.fileStore.readFile(path));
+@@ -369,18 +378,20 @@ export function createKtxScanDescriptionResumeStore(deps: {
+       }
+       try {
+         const record = JSON.parse(content) as DescriptionsProgressRecord | null;
+-        // A changed inputHash (schema or enrichment settings changed) ignores the
+-        // prior record and recomputes — spec-19's inputHash-gated resume semantics.
+-        if (!record || record.inputHash !== inputHash || !Array.isArray(record.descriptions)) {
++        // [fix bug2] Return the whole record + per-table hashes; the caller recovers
++        // each table whose own hash still matches (per-table resume), so an unrelated
++        // table change no longer discards the rest. A pre-fix record (no tableHashes)
++        // recovers nothing and safely recomputes.
++        if (!record || !Array.isArray(record.descriptions)) {
+           return null;
+         }
+-        return record.descriptions;
++        return { descriptions: record.descriptions, tableHashes: record.tableHashes ?? {} };
+       } catch {
+         return null;
+       }
+     },
+-    async flush({ inputHash, snapshot, descriptionUpdates, changedTableNames }) {
+-      const record: DescriptionsProgressRecord = { inputHash, descriptions: descriptionUpdates };
++    async flush({ inputHash, snapshot, descriptionUpdates, tableHashes, changedTableNames }) {
++      const record: DescriptionsProgressRecord = { inputHash, descriptions: descriptionUpdates, tableHashes };
+       await writeJsonArtifact(
+         deps.project,
+         path,
+diff --git a/packages/cli/src/context/scan/local-enrichment.ts b/packages/cli/src/context/scan/local-enrichment.ts
+index 8b4da128..0c878fb3 100644
+--- a/packages/cli/src/context/scan/local-enrichment.ts
++++ b/packages/cli/src/context/scan/local-enrichment.ts
+@@ -10,6 +10,7 @@ import {
+   computeKtxEmbeddingsStageHash,
+   computeKtxRelationshipsStageHash,
+   computeKtxScanDescriptionDigest,
++  computeKtxTableDescriptionHash,
+   KTX_SCAN_ENRICHMENT_STAGES,
+   type KtxScanEmbeddingIdentity,
+   type KtxScanEnrichmentStateStore,
+@@ -352,6 +353,7 @@ async function generateDescriptions(input: {
+   context: KtxScanContext;
+   providers: KtxLocalScanEnrichmentProviders;
+   inputHash: string;
++  llmIdentity: KtxScanLlmIdentity;
+   resumeStore?: KtxScanDescriptionResumeStore | null;
+   progress?: KtxProgressPort;
+   warnings?: KtxScanWarning[];
+@@ -384,11 +386,26 @@ async function generateDescriptions(input: {
+   // Resume: recover already-enriched tables (inputHash-gated) and re-issue LLM
+   // calls only for the remainder. A failed/skipped table carries null descriptions
+   // and is not recovered, so it is retried.
+-  const recovered = input.resumeStore ? ((await input.resumeStore.load(input.inputHash)) ?? []) : [];
++  // [fix bug2] Recover per table: each table gated on its own hash (structure +
++  // llmIdentity), so adding/removing an unrelated table no longer discards the rest.
++  const currentTableHashes = new Map<string, string>();
++  for (const t of input.snapshot.tables) {
++    currentTableHashes.set(
++      tableRefKey(tableRef(t)),
++      computeKtxTableDescriptionHash({ table: t, llmIdentity: input.llmIdentity }),
++    );
++  }
++  const prior = input.resumeStore ? await input.resumeStore.load() : null;
++  const priorTableHashes = prior?.tableHashes ?? {};
+   const enrichedById = new Map<string, KtxScanDescriptionUpdate>();
+-  for (const update of recovered) {
+-    if (isEnrichedDescriptionUpdate(update)) {
+-      enrichedById.set(tableRefKey(update.table), update);
++  for (const update of prior?.descriptions ?? []) {
++    const key = tableRefKey(update.table);
++    if (
++      isEnrichedDescriptionUpdate(update) &&
++      priorTableHashes[key] !== undefined &&
++      priorTableHashes[key] === currentTableHashes.get(key)
++    ) {
++      enrichedById.set(key, update);
+     }
+   }
+   const remaining = input.snapshot.tables.filter((table) => !enrichedById.has(tableRefKey(tableRef(table))));
+@@ -418,6 +435,9 @@ async function generateDescriptions(input: {
+         inputHash: input.inputHash,
+         snapshot: input.snapshot,
+         descriptionUpdates: [...enrichedById.values()],
++        tableHashes: Object.fromEntries(
++          [...enrichedById.keys()].map((key) => [key, currentTableHashes.get(key) ?? '']),
++        ),
+         changedTableNames,
+       });
+     } finally {
+@@ -756,6 +776,7 @@ export async function runLocalScanEnrichment(
+             context: input.context,
+             providers,
+             inputHash: descriptionsHash,
++            llmIdentity,
+             resumeStore: input.descriptionResumeStore,
+             progress: descriptionProgress,
+             warnings,
