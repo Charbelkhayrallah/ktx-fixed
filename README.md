@@ -1,7 +1,8 @@
 # ktx-fixed
 
 `ktx` **0.16.0** with two fixes so `ktx ingest` **reuses the AI descriptions it
-already generated** instead of regenerating them on every run.
+already generated** instead of regenerating them on every run, plus one so its
+**MCP tools run in Claude Code**.
 
 Unofficial patched build of [Kaelio/ktx](https://github.com/Kaelio/ktx).
 Not affiliated with or endorsed by Kaelio.
@@ -71,6 +72,20 @@ Together these restore behaviour ktx's own
 [CLI reference](https://docs.kaelio.com/ktx/docs/cli-reference/ktx-ingest)
 already documents.
 
+**3. MCP tool schemas advertise JSON Schema 2020-12, not draft-07**
+(`scripts/patch-mcp-sdk-dialect.cjs` in the build). Every ktx
+tool failed in Claude Code before its handler ran, on an `invalid outputSchema:
+... unsupported dialect` error. Not a ktx bug and ktx is untouched: the MCP SDK
+hardcodes `'draft-7'` in `mapMiniTarget()` when no target is passed, and never
+passes one ([typescript-sdk#745](https://github.com/modelcontextprotocol/typescript-sdk/issues/745),
+still hardcoded in 1.30.0). The patch flips that one branch. Because the SDK
+lives in `node_modules` it runs as a `postinstall` hook, and is idempotent — re-run
+it to apply or to check, then restart the daemon:
+
+```bash
+node scripts/patch-mcp-sdk-dialect.cjs && ktx mcp stop && ktx mcp start
+```
+
 ## This is temporary
 
 Both bugs are reported upstream: [#347](https://github.com/Kaelio/ktx/issues/347)
@@ -87,8 +102,14 @@ npm i -g @kaelio/ktx
 git clone https://github.com/Kaelio/ktx.git
 cd ktx
 git apply /path/to/ktx-fixes.diff
+tar xzOf /path/to/ktx-fixed.tgz package/scripts/patch-mcp-sdk-dialect.cjs \
+  > packages/cli/scripts/patch-mcp-sdk-dialect.cjs
 pnpm install && cd packages/cli && pnpm run build && npm pack
 ```
+
+For fix 3, `packages/cli/package.json` also needs `"postinstall": "node
+scripts/patch-mcp-sdk-dialect.cjs"` in `scripts`, and
+`"scripts/patch-mcp-sdk-dialect.cjs"` added to `files` so `npm pack` ships it.
 
 Rename the resulting `.tgz` to `ktx-fixed.tgz`, commit it here, and the install
 command above keeps working unchanged.
