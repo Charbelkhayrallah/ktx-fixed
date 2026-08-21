@@ -14,7 +14,7 @@ npm uninstall -g @kaelio/ktx
 npm i -g https://raw.githubusercontent.com/Charbelkhayrallah/ktx-fixed/main/ktx-fixed.tgz
 ```
 
-Check it worked — should print `@charbelkh/ktx 0.16.1`:
+Check it worked — should print `@charbelkh/ktx 0.16.2`:
 
 ```bash
 ktx --version
@@ -90,11 +90,18 @@ node scripts/patch-mcp-sdk-dialect.cjs && ktx mcp stop && ktx mcp start
 
 Both bugs are reported upstream: [#347](https://github.com/Kaelio/ktx/issues/347)
 and [#348](https://github.com/Kaelio/ktx/issues/348). **Once they ship, drop this
-build** and go back to:
+build** and go back to the official one:
 
 ```bash
+npm uninstall -g @charbelkh/ktx
 npm i -g @kaelio/ktx
 ```
+
+Nothing to clean up after that. The MCP SDK patch lives inside this package's own
+`node_modules`, so it is removed along with the package and no global install is left
+modified. Your ktx projects are untouched — `ktx.yaml`, `semantic-layer/`, `wiki/` and
+`raw-sources/` are just files — and the shared Python runtime under `~/.ktx/runtime` stays
+unless you delete it yourself.
 
 ## Rebuilding (only if upstream releases a new version)
 
