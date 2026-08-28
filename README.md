@@ -71,8 +71,13 @@ The difference is what happens on a **re-run**:
 | Ctrl-C mid-ingest, then re-run | Starts over | Keeps finished tables |
 | Adding one table | Re-runs all of them | Runs only the new one |
 
-**One exception.** If a run hit an LLM rate limit and left some descriptions
-empty, a plain re-run will not retry them. Fill them in with:
+**Rare exception.** A plain re-run normally *does* retry descriptions an LLM
+rate limit left empty — the per-table resume above handles it, and on an active
+database the stage hash drifts anyway, so the stage re-enters and fills only the
+gaps. It fails to only when the descriptions stage was recorded complete under a
+byte-identical stage hash, which needs the schema, every table's row-count
+estimate, and the LLM identity all unchanged since that run. If a re-run makes no
+LLM calls and descriptions are still missing, force the stage:
 
 ```bash
 ktx ingest <connection-id> --stages descriptions
@@ -115,6 +120,15 @@ The resume record was all-or-nothing on a single whole-batch hash, so touching
 one table discarded every description in the batch. `DescriptionsProgressRecord`
 gains a `tableHashes` map keyed by table ref, and each table is now recovered
 independently.
+
+The load-bearing part is that `load()` **drops its `inputHash` gate**. Upstream
+returned the prior record only when `record.inputHash === inputHash`, so any
+change to the stage hash threw away every description. It now always returns the
+record, and the per-table hash alone decides what is recovered — `inputHash` is
+still written by `flush()` but is never compared. That is what makes resume
+survive a changed stage hash, which matters because the stage hash is *not*
+stable: `stableSnapshotHashInput()` strips only `extractedAt`, so every table's
+`estimatedRows` is still in it and any row-count drift re-keys the stage.
 
 Together, changes 1 and 2 restore the behaviour ktx's own
 [CLI reference](https://docs.kaelio.com/ktx/docs/cli-reference/ktx-ingest)
