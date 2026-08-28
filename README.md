@@ -1,7 +1,7 @@
 # ktx-fixed
 
 An unofficial patched build of [`@kaelio/ktx`](https://github.com/Kaelio/ktx)
-**v0.16.0**, published as **`@charbelkh/ktx` 0.16.3**. Four fixes, all in this
+**v0.16.0**, published as **`@charbelkh/ktx` 0.16.4**. Five fixes, all in this
 repo as a single patch you can apply to a pristine upstream checkout.
 
 Not affiliated with or endorsed by Kaelio. Apache-2.0, same as upstream.
@@ -12,6 +12,7 @@ Not affiliated with or endorsed by Kaelio. Apache-2.0, same as upstream.
 | 2 | Adding one table discards all the other descriptions | Track a resume hash per table instead of per batch |
 | 3 | Every ktx MCP tool fails in Claude Code before it runs | Make the MCP SDK advertise JSON Schema 2020-12 |
 | 4 | Ctrl-C cannot stop an ingest | Stop leaking the terminal into raw mode |
+| 5 | Postgres foreign keys all missing, silently, unless you own the tables | Read them from `pg_catalog` instead of `information_schema` |
 
 ### What is in this repo
 
@@ -29,7 +30,7 @@ npm uninstall -g @kaelio/ktx
 npm i -g https://raw.githubusercontent.com/Charbelkhayrallah/ktx-fixed/main/ktx-fixed.tgz
 ```
 
-Check it worked — should print `@charbelkh/ktx 0.16.3`:
+Check it worked — should print `@charbelkh/ktx 0.16.4`:
 
 ```bash
 ktx --version
@@ -177,6 +178,51 @@ difference is that the two daemon lines no longer animate.
 Not yet reported upstream — worth doing, since it affects any ktx install using
 `sentence-transformers` embeddings.
 
+### 5. Postgres foreign keys are read from `pg_catalog`, not `information_schema`
+
+`connectors/postgres/connector.ts`. On Postgres, ktx discovered **zero** foreign
+keys whenever the connecting account did not **own** the tables. Primary keys
+came back complete at the same time, so nothing looked broken — the semantic
+layer simply had no declared relationships in it.
+
+The two queries differ by a single join. The primary-key query reads
+`information_schema.table_constraints` joined to `key_column_usage`; both are
+visible to anyone holding *any privilege other than SELECT*. The foreign-key
+query additionally joined `information_schema.constraint_column_usage`, which
+Postgres exposes only for tables **owned by a currently enabled role**.
+Ownership, not privilege. A fully-granted non-owner gets zero rows from that
+view, and the inner join discards every foreign key.
+
+Nothing warns. `tryConstraintQuery` reports a failure only when the query
+*throws* `42501` / `42P01`, and a privilege-filtered view does not throw — it
+returns no rows. So the scan writes `"foreignKeys": []` alongside
+`"warnings": []`, and ktx falls back to *inferring* relationships with the LLM
+and embeddings, spending tokens to re-derive keys the database already declares.
+
+Measured against a 307-table Fineract schema holding 531 declared foreign keys,
+connecting as a role with SELECT/INSERT/UPDATE/DELETE/REFERENCES/TRIGGER that
+owns nothing:
+
+| | before | after |
+|---|---|---|
+| primary keys captured | 299 / 299 | 299 / 299 |
+| foreign keys captured | **0 / 531** | **531 / 531** |
+| `constraint_column_usage` rows visible | 0 | 0 (no longer used) |
+| relationship detection | inferred: 131 accepted, 431 rejected, 306 validation queries | declared keys used directly |
+
+The fix queries `pg_catalog.pg_constraint`, unnesting `conkey`/`confkey` `WITH
+ORDINALITY` so composite keys keep their column pairing. `pg_catalog` has no
+ownership gate, so it works without granting anything, and the result shape is
+unchanged.
+
+> **Upgrading re-describes tables once.** Foreign keys are part of a table's
+> hash, so tables that gain keys count as changed — 235 of 307 on the schema
+> above. That pass is one-off and correct; afterwards the cache behaves normally.
+
+Not yet reported upstream — worth doing, since it silently degrades every
+Postgres project whose ktx account is not the table owner, which is the normal
+setup for a read-only analytics user.
+
 ## Known limitation: pin Claude Code to 2.1.233
 
 Not fixed by this build. ktx 0.16.x asserts that only its own known built-in
@@ -214,7 +260,7 @@ pnpm run build
 npm pack
 ```
 
-That produces `charbelkh-ktx-0.16.3.tgz`. Rename it to `ktx-fixed.tgz`, commit it
+That produces `charbelkh-ktx-0.16.4.tgz`. Rename it to `ktx-fixed.tgz`, commit it
 here, and the install command at the top keeps working unchanged.
 
 The patch is self-contained: it carries the new `patch-mcp-sdk-dialect.cjs` and
@@ -224,12 +270,28 @@ entry for the script, the `postinstall` hook, and dropping
 install` will run that `postinstall` in your dev tree too; harmless, and
 idempotent.
 
-Bundling the Python runtime assets needs no special step: `pnpm run build`
-already runs `scripts/copy-runtime-assets.mjs`, and `files: ["dist", "assets"]`
-ships the result.
+Bundling the Python runtime assets needs one caveat. `pnpm run build` does run
+`scripts/copy-runtime-assets.mjs`, and `files: ["dist", "assets"]` ships the
+result — but on a **pristine** clone there is nothing to copy yet, and the step
+fails silently. `npm pack` then produces **1210** files instead of 1212, missing
+`assets/python/manifest.json` and `assets/python/kaelio_ktx-0.16.0-py3-none-any.whl`,
+and the CLI dies with `Missing bundled Python runtime manifest` the first time it
+needs local embeddings.
+
+`pnpm run artifacts:build-runtime` generates them, but pins an exact `uv`
+(`==0.11.11` for 0.16.0). If your `uv` differs, copy the two files from the
+previous tarball instead — the wheel is upstream's Python daemon and none of
+these fixes touch `python/`:
+
+```bash
+tar xzOf /path/to/previous/ktx-fixed.tgz package/assets/python/manifest.json   > packages/cli/assets/python/manifest.json
+tar xzOf /path/to/previous/ktx-fixed.tgz package/assets/python/kaelio_ktx-0.16.0-py3-none-any.whl   > packages/cli/assets/python/kaelio_ktx-0.16.0-py3-none-any.whl
+```
+
+Check `tar -tzf ktx-fixed.tgz | wc -l` reads 1212 before committing.
 
 To port the patch to a newer upstream release, apply it to that tag instead. All
-four changes are small and localised; if a hunk stops applying, the sections
+five changes are small and localised; if a hunk stops applying, the sections
 above say what each one has to accomplish.
 
 ### What has been verified
@@ -242,12 +304,17 @@ Against a pristine `git clone` of upstream at tag `v0.16.0` (commit `a6dd8cf`):
   `packages/cli/scripts/patch-mcp-sdk-dialect.cjs` is byte-identical to the
   shipped copy. (Line endings and a byte-order mark may differ — the shipped
   copies were written on Windows. No content differs.)
-- The shipped `dist/` carries all four fixes: `stableSnapshotHashInput` and
+- The shipped `dist/` carries all five fixes: `stableSnapshotHashInput` and
   `computeKtxTableDescriptionHash` in `dist/context/scan/enrichment-state.js`,
   `tableHashes` in `dist/context/scan/local-enrichment-artifacts.js`,
   `restoreCookedStdin` and `createStaticCliSpinner` in
-  `dist/managed-local-embeddings.js`, and `scripts/patch-mcp-sdk-dialect.cjs` in
-  the package.
+  `dist/managed-local-embeddings.js`, `pg_catalog.pg_constraint` in
+  `dist/connectors/postgres/connector.js`, and `scripts/patch-mcp-sdk-dialect.cjs`
+  in the package.
+- Fix 5 was exercised end to end against a live 307-table Fineract schema with
+  531 declared foreign keys, connecting as a non-owner: `foreign-keys.json` went
+  from `{"foreignKeys": []}` to 531 entries, `warnings.json` stayed empty, and
+  primary keys were 299/299 before and after.
 
 ## This is temporary
 

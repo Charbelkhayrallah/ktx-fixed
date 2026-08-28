@@ -1,5 +1,5 @@
 diff --git a/packages/cli/package.json b/packages/cli/package.json
-index af4bf65..2d97985 100644
+index af4bf65..a931951 100644
 --- a/packages/cli/package.json
 +++ b/packages/cli/package.json
 @@ -1,7 +1,7 @@
@@ -8,7 +8,7 @@ index af4bf65..2d97985 100644
 -  "version": "0.16.0",
 -  "description": "Standalone ktx context layer for data agents",
 +  "name": "@charbelkh/ktx",
-+  "version": "0.16.3",
++  "version": "0.16.4",
 +  "description": "Patched fork of @kaelio/ktx 0.16.0 - ktx ingest reuses already-generated AI descriptions instead of regenerating them (upstream issues #347, #348)",
    "author": {
      "name": "Kaelio",
@@ -108,6 +108,65 @@ index 0000000..f4ed9d3
 +} catch (err) {
 +    console.warn(`[ktx] mcp-sdk dialect patch skipped: ${err.message}`);
 +}
+diff --git a/packages/cli/src/connectors/postgres/connector.ts b/packages/cli/src/connectors/postgres/connector.ts
+index c2c0f6d..b5b8a4f 100644
+--- a/packages/cli/src/connectors/postgres/connector.ts
++++ b/packages/cli/src/connectors/postgres/connector.ts
+@@ -697,29 +697,37 @@ export class KtxPostgresScanConnector implements KtxScanConnector {
+     if (!primaryKeysResult.ok) {
+       snapshotWarnings.push(primaryKeysResult.warning);
+     }
++    // Foreign keys come from pg_catalog, not information_schema.
++    // information_schema.constraint_column_usage only exposes columns of tables
++    // OWNED BY a currently enabled role, so a fully-granted non-owner sees zero
++    // rows there and the join silently drops every foreign key -- while the
++    // primary-key query above, which never touches that view, still returns all
++    // of them. pg_catalog.pg_constraint has no ownership gate.
+     const foreignKeysResult = await tryConstraintQuery(
+       { schema, kind: 'foreign_key', isDeniedError },
+       () =>
+         this.queryRaw<PostgresForeignKeyRow>(
+           `
+       SELECT
+-        tc.table_name,
+-        kcu.column_name,
+-        ccu.table_schema AS foreign_table_schema,
+-        ccu.table_name AS foreign_table_name,
+-        ccu.column_name AS foreign_column_name,
+-        tc.constraint_name
+-      FROM information_schema.table_constraints AS tc
+-      JOIN information_schema.key_column_usage AS kcu
+-        ON tc.constraint_name = kcu.constraint_name
+-        AND tc.table_schema = kcu.table_schema
+-      JOIN information_schema.constraint_column_usage AS ccu
+-        ON ccu.constraint_name = tc.constraint_name
+-        AND ccu.table_schema = tc.table_schema
+-      WHERE tc.constraint_type = 'FOREIGN KEY'
+-        AND tc.table_schema = $1
+-        ${tableConstraintScopeClause}
+-      ORDER BY tc.table_name, kcu.column_name
++        c.relname AS table_name,
++        a.attname AS column_name,
++        fn.nspname AS foreign_table_schema,
++        fc.relname AS foreign_table_name,
++        fa.attname AS foreign_column_name,
++        con.conname AS constraint_name
++      FROM pg_catalog.pg_constraint con
++      JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
++      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
++      JOIN pg_catalog.pg_class fc ON fc.oid = con.confrelid
++      JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace
++      JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS ck(attnum, ord) ON true
++      JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS fk(attnum, ord) ON ck.ord = fk.ord
++      JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = ck.attnum
++      JOIN pg_catalog.pg_attribute fa ON fa.attrelid = fc.oid AND fa.attnum = fk.attnum
++      WHERE con.contype = 'f'
++        AND n.nspname = $1
++        ${pgCatalogScopeClause}
++      ORDER BY c.relname, con.conname, ck.ord
+       `,
+           [schema, ...scopeValues],
+         ),
 diff --git a/packages/cli/src/context/scan/enrichment-state.ts b/packages/cli/src/context/scan/enrichment-state.ts
 index 84b6224..3fbc3a4 100644
 --- a/packages/cli/src/context/scan/enrichment-state.ts
