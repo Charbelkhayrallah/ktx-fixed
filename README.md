@@ -248,9 +248,12 @@ A run that ended with tables still undescribed — an LLM rate limit, a dropped
 database connection, anything that leaves nulls — stored that result as a
 **completed** stage keyed on the stage hash. Every later `ktx ingest` whose hash
 matched found the completed row, handed the gap straight back, finished in
-seconds and printed a clean tick. The gap became permanent, and nothing said so:
-tables that were never attempted raise no `enrichment_failed` of their own, so
-`warnings.json` stayed empty too.
+seconds and printed a clean tick. The gap became permanent, and the only record
+was easy to miss: enrichment warnings are written to the run's
+`scan-report.json` (its `warnings` array), **not** to `warnings.json`, which the
+structural scan writes and which stays empty regardless. Tables never attempted
+raise no `enrichment_failed` of their own either, so even that array can look
+clean.
 
 Observed on a 349-table project. Two rows cached as `status=completed`, each
 carrying `217/349` descriptions and 132 nulls; the scan report showed
@@ -275,8 +278,16 @@ single gap fails it. The stage then re-enters `compute()`, change 2's per-table
 resume recovers everything already described, and only the missing tables reach
 the LLM.
 
-A `descriptions_incomplete` warning now names the count, so an incomplete run is
-visible in `warnings.json` instead of silent.
+A `descriptions_incomplete` warning now names the count, so an incomplete run
+says so instead of passing silently. Look for it in the run's
+`scan-report.json` under `warnings` — not `warnings.json`, which carries the
+structural scan's warnings and is a different file:
+
+```json
+{ "code": "descriptions_incomplete",
+  "message": "43 of 349 tables have no AI description. This result was not cached, so re-running `ktx ingest` once the LLM is available will describe only those tables.",
+  "metadata": { "undescribed": 43, "total": 349 } }
+```
 
 > **Consequence worth knowing.** While any table is undescribed, the descriptions
 > stage is not cacheable, so every run re-enters it. That costs one cheap
