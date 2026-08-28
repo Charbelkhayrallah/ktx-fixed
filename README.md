@@ -246,53 +246,148 @@ upstream's list of 12 unchanged.
 
 ## Rebuild from source
 
-Only needed to verify this build, or when upstream ships a new version. Requires
-Node >= 22 and pnpm 11.4.0 (upstream's `packageManager`).
+**This README is self-contained.** With only this file and the upstream
+repository you can reproduce this exact package — the complete patch is in
+[Appendix: the complete patch](#appendix-the-complete-patch) at the end, and
+`ktx-fixes.diff` in this repo is a byte-identical copy of it.
+
+### Prerequisites
+
+| | |
+|---|---|
+| Node | >= 22 (built with 22.18.0) |
+| pnpm | 11.4.0 — upstream's `packageManager`; `corepack enable` picks it up |
+| uv | only for regenerating the Python wheel; must be **exactly** the version upstream pins (`==0.11.11` for 0.16.0). Not needed if you copy the assets, see step 5. |
+
+### Steps
+
+**1. Get a pristine upstream checkout at the tag this patch targets.**
 
 ```bash
 git clone https://github.com/Kaelio/ktx.git
 cd ktx
-git checkout v0.16.0
-git apply /path/to/ktx-fixes.diff
+git checkout v0.16.0        # commit a6dd8cf
+```
+
+**2. Write the patch to a file.** Either use `ktx-fixes.diff` from this repo, or
+copy the fenced block in the appendix below into `ktx-fixes.diff` verbatim.
+
+**3. Apply it.** Check first — it must apply with no fuzz:
+
+```bash
+git apply --check ktx-fixes.diff && git apply ktx-fixes.diff
+git status --porcelain
+```
+
+Expected — six modified files plus one new one:
+
+```
+ M packages/cli/package.json
+ M packages/cli/src/connectors/postgres/connector.ts
+ M packages/cli/src/context/scan/enrichment-state.ts
+ M packages/cli/src/context/scan/local-enrichment-artifacts.ts
+ M packages/cli/src/context/scan/local-enrichment.ts
+ M packages/cli/src/managed-local-embeddings.ts
+?? packages/cli/scripts/patch-mcp-sdk-dialect.cjs
+```
+
+The patch is self-contained: it creates `patch-mcp-sdk-dialect.cjs` and makes the
+`package.json` edits that go with it — `name`, `version`, `description`, the
+`files` entry for the script, the `postinstall` hook, and dropping
+`publishConfig.provenance`, which only works from upstream's own CI. `pnpm
+install` runs that `postinstall` in your dev tree too; harmless and idempotent.
+
+**4. Install and build.**
+
+```bash
 pnpm install
 cd packages/cli
 pnpm run build
+```
+
+`pnpm run build` must exit 0. It runs `tsc`, writes the telemetry schema, copies
+runtime assets, and prepares the CLI bin.
+
+> `pnpm install --ignore-scripts` also works and skips the postinstall; the
+> script is re-run for real by consumers at install time either way.
+
+**5. Make sure the Python runtime assets are present — this step is easy to miss.**
+
+`pnpm run build` runs `scripts/copy-runtime-assets.mjs`, and `files: ["dist",
+"assets"]` ships the result — but on a **pristine** clone there is nothing to
+copy yet and the step fails silently. `npm pack` then produces **1210** files
+instead of 1212, missing `assets/python/manifest.json` and
+`assets/python/kaelio_ktx-0.16.0-py3-none-any.whl`, and the installed CLI dies
+with `Missing bundled Python runtime manifest` the first time it needs local
+embeddings.
+
+Either regenerate them (needs the exact pinned `uv`):
+
+```bash
+cd ../..                     # repo root
+pnpm run artifacts:build-runtime
+cd packages/cli
+```
+
+or copy them from the previous tarball — the wheel is upstream's own Python
+daemon and none of these fixes touch `python/`, so this is equivalent:
+
+```bash
+mkdir -p assets/python
+tar -xzOf /path/to/previous/ktx-fixed.tgz package/assets/python/manifest.json   > assets/python/manifest.json
+tar -xzOf /path/to/previous/ktx-fixed.tgz package/assets/python/kaelio_ktx-0.16.0-py3-none-any.whl   > assets/python/kaelio_ktx-0.16.0-py3-none-any.whl
+```
+
+On Windows/Git Bash, `tar` reads a leading `C:` as a hostname — copy the tarball
+to a relative path first, or pass `--force-local`.
+
+**6. Pack.**
+
+```bash
 npm pack
 ```
 
-That produces `charbelkh-ktx-0.16.4.tgz`. Rename it to `ktx-fixed.tgz`, commit it
-here, and the install command at the top keeps working unchanged.
+Produces `charbelkh-ktx-0.16.4.tgz`. Rename to `ktx-fixed.tgz` and commit it
+here; the install command at the top of this README keeps working unchanged.
 
-The patch is self-contained: it carries the new `patch-mcp-sdk-dialect.cjs` and
-the `package.json` edits it needs — `name`, `version`, `description`, the `files`
-entry for the script, the `postinstall` hook, and dropping
-`publishConfig.provenance`, which only works from upstream's own CI. `pnpm
-install` will run that `postinstall` in your dev tree too; harmless, and
-idempotent.
+### Verify the rebuild
 
-Bundling the Python runtime assets needs one caveat. `pnpm run build` does run
-`scripts/copy-runtime-assets.mjs`, and `files: ["dist", "assets"]` ships the
-result — but on a **pristine** clone there is nothing to copy yet, and the step
-fails silently. `npm pack` then produces **1210** files instead of 1212, missing
-`assets/python/manifest.json` and `assets/python/kaelio_ktx-0.16.0-py3-none-any.whl`,
-and the CLI dies with `Missing bundled Python runtime manifest` the first time it
-needs local embeddings.
-
-`pnpm run artifacts:build-runtime` generates them, but pins an exact `uv`
-(`==0.11.11` for 0.16.0). If your `uv` differs, copy the two files from the
-previous tarball instead — the wheel is upstream's Python daemon and none of
-these fixes touch `python/`:
+Run these against the tarball you just produced. All must pass:
 
 ```bash
-tar xzOf /path/to/previous/ktx-fixed.tgz package/assets/python/manifest.json   > packages/cli/assets/python/manifest.json
-tar xzOf /path/to/previous/ktx-fixed.tgz package/assets/python/kaelio_ktx-0.16.0-py3-none-any.whl   > packages/cli/assets/python/kaelio_ktx-0.16.0-py3-none-any.whl
+T=ktx-fixed.tgz
+tar -tzf $T | wc -l                                    # 1212
+tar -tzf $T | grep -c 'assets/python'                  # 2
+tar -tzf $T | grep -c 'scripts/patch-mcp-sdk-dialect'  # 1
+tar -xzOf $T package/package.json | grep '"version"'   # 0.16.4
+
+# one grep per fix, against the compiled output
+tar -xzOf $T package/dist/context/scan/enrichment-state.js            | grep -c stableSnapshotHashInput        # >0  fix 1
+tar -xzOf $T package/dist/context/scan/enrichment-state.js            | grep -c computeKtxTableDescriptionHash # >0  fix 1
+tar -xzOf $T package/dist/context/scan/local-enrichment-artifacts.js  | grep -c tableHashes                    # >0  fix 2
+tar -xzOf $T package/dist/managed-local-embeddings.js                 | grep -c restoreCookedStdin             # >0  fix 4
+tar -xzOf $T package/dist/managed-local-embeddings.js                 | grep -c createStaticCliSpinner         # >0  fix 4
+tar -xzOf $T package/dist/connectors/postgres/connector.js            | grep -c pg_catalog.pg_constraint       # >0  fix 5
 ```
 
-Check `tar -tzf ktx-fixed.tgz | wc -l` reads 1212 before committing.
+Then install it and confirm the version:
 
-To port the patch to a newer upstream release, apply it to that tag instead. All
-five changes are small and localised; if a hunk stops applying, the sections
-above say what each one has to accomplish.
+```bash
+npm uninstall -g @kaelio/ktx @charbelkh/ktx
+npm i -g ./ktx-fixed.tgz
+ktx --version                                          # @charbelkh/ktx 0.16.4
+ktx admin runtime install --feature local-embeddings --yes
+```
+
+The embeddings runtime is installed **per ktx version** under
+`~/.ktx/runtime/<version>/`, so it reports `missing` after every version bump
+until you run that last command again.
+
+### Porting to a newer upstream release
+
+Apply the patch to that tag instead. All five changes are small and localised; if
+a hunk stops applying, the numbered sections above say what each one has to
+accomplish, in enough detail to redo it by hand.
 
 ### What has been verified
 
@@ -331,6 +426,490 @@ Nothing to clean up after that. The MCP SDK patch lives inside this package's ow
 left modified. Your ktx projects are untouched — `ktx.yaml`, `semantic-layer/`,
 `wiki/` and `raw-sources/` are just files — and the shared Python runtime under
 `~/.ktx/runtime` stays unless you delete it yourself.
+
+## Appendix: the complete patch
+
+Everything above is narrative; this is the artifact. It is byte-identical to
+`ktx-fixes.diff` in this repo — reproduced here so this README alone is enough to
+rebuild the package.
+
+To use it, copy the contents of the fenced block into a file named
+`ktx-fixes.diff` and follow [Rebuild from source](#rebuild-from-source). It
+applies to a pristine upstream checkout at tag `v0.16.0` (commit `a6dd8cf`) and
+touches seven files:
+
+| File | Fix |
+|---|---|
+| `packages/cli/package.json` | 3 — name, version, `files`, `postinstall`, drop `publishConfig.provenance` |
+| `packages/cli/scripts/patch-mcp-sdk-dialect.cjs` *(new)* | 3 |
+| `packages/cli/src/context/scan/enrichment-state.ts` | 1 |
+| `packages/cli/src/context/scan/local-enrichment-artifacts.ts` | 2 |
+| `packages/cli/src/context/scan/local-enrichment.ts` | 2 |
+| `packages/cli/src/managed-local-embeddings.ts` | 4 |
+| `packages/cli/src/connectors/postgres/connector.ts` | 5 |
+
+If you edit one copy, regenerate the other — `git diff > ktx-fixes.diff` from the
+patched checkout, having first `git add -N` the new script so it is included.
+They must stay in sync; verify with:
+
+```bash
+diff <(sed -n '/^```diff$/,/^```$/p' README.md | sed '1d;$d') ktx-fixes.diff
+```
+
+```diff
+diff --git a/packages/cli/package.json b/packages/cli/package.json
+index af4bf65..a931951 100644
+--- a/packages/cli/package.json
++++ b/packages/cli/package.json
+@@ -1,7 +1,7 @@
+ {
+-  "name": "@kaelio/ktx",
+-  "version": "0.16.0",
+-  "description": "Standalone ktx context layer for data agents",
++  "name": "@charbelkh/ktx",
++  "version": "0.16.4",
++  "description": "Patched fork of @kaelio/ktx 0.16.0 - ktx ingest reuses already-generated AI descriptions instead of regenerating them (upstream issues #347, #348)",
+   "author": {
+     "name": "Kaelio",
+     "url": "https://www.kaelio.com"
+@@ -25,17 +25,18 @@
+   },
+   "files": [
+     "dist",
+-    "assets"
++    "assets",
++    "scripts/patch-mcp-sdk-dialect.cjs"
+   ],
+   "publishConfig": {
+-    "access": "public",
+-    "provenance": true
++    "access": "public"
+   },
+   "scripts": {
+     "assets:demo": "node scripts/build-demo-assets.mjs",
+     "build": "tsc -p tsconfig.json && node dist/telemetry/schema-writer.js src/telemetry/events.schema.json ../../python/ktx-daemon/src/ktx_daemon/telemetry/events.schema.json && node scripts/copy-runtime-assets.mjs && node ../../scripts/prepare-cli-bin.mjs",
+     "clean": "node -e \"fs.rmSync('dist', { recursive: true, force: true })\"",
+     "docs:commands": "pnpm run build && node dist/print-command-tree.js",
++    "postinstall": "node scripts/patch-mcp-sdk-dialect.cjs",
+     "smoke": "vitest run test/standalone-smoke.test.ts test/example-smoke.test.ts --testTimeout 30000",
+     "test": "vitest run --exclude test/standalone-smoke.test.ts --exclude test/example-smoke.test.ts --exclude test/setup-databases.test.ts --exclude test/scan.test.ts --exclude test/commands/connection-metabase-setup.test.ts --exclude test/setup-models.test.ts --exclude test/setup-sources.test.ts --exclude test/setup.test.ts --exclude test/connection.test.ts --exclude test/setup-embeddings.test.ts --exclude test/ingest.test.ts --exclude test/commands/connection-mapping.test.ts --exclude test/ingest-viz.test.ts --exclude test/demo.test.ts --exclude test/setup-project.test.ts --exclude test/sl.test.ts --exclude test/local-scan-connectors.test.ts --exclude test/commands/connection-notion.test.ts --exclude test/context/scan/local-scan.test.ts --exclude test/context/mcp/local-project-ports.test.ts --exclude test/context/ingest/local-stage-ingest.test.ts --exclude test/context/sl/pglite-sl-search-prototype.test.ts --exclude test/context/core/git.service.test.ts --exclude test/context/ingest/local-adapters.test.ts --exclude test/context/ingest/local-bundle-ingest.test.ts --exclude test/context/ingest/local-metabase-ingest.test.ts --exclude test/context/sl/local-sl.test.ts --exclude test/context/search/pglite-owner-process.test.ts --exclude test/context/scan/local-enrichment-artifacts.test.ts --exclude test/context/search/pglite-spike.test.ts --exclude test/context/wiki/local-knowledge.test.ts --exclude test/context/sl/local-query.test.ts --exclude test/context/scan/relationship-review-decisions.test.ts --exclude test/context/scan/relationship-profiling.test.ts",
+     "test:slow": "vitest run test/setup-databases.test.ts test/scan.test.ts test/commands/connection-metabase-setup.test.ts test/setup-models.test.ts test/setup-sources.test.ts test/setup.test.ts test/connection.test.ts test/setup-embeddings.test.ts test/ingest.test.ts test/commands/connection-mapping.test.ts test/ingest-viz.test.ts test/demo.test.ts test/setup-project.test.ts test/sl.test.ts test/local-scan-connectors.test.ts test/commands/connection-notion.test.ts test/context/scan/local-scan.test.ts test/context/mcp/local-project-ports.test.ts test/context/ingest/local-stage-ingest.test.ts test/context/sl/pglite-sl-search-prototype.test.ts test/context/core/git.service.test.ts test/context/ingest/local-adapters.test.ts test/context/ingest/local-bundle-ingest.test.ts test/context/ingest/local-metabase-ingest.test.ts test/context/sl/local-sl.test.ts test/context/search/pglite-owner-process.test.ts test/context/scan/local-enrichment-artifacts.test.ts test/context/search/pglite-spike.test.ts test/context/wiki/local-knowledge.test.ts test/context/sl/local-query.test.ts test/context/scan/relationship-review-decisions.test.ts test/context/scan/relationship-profiling.test.ts --testTimeout 30000",
+diff --git a/packages/cli/scripts/patch-mcp-sdk-dialect.cjs b/packages/cli/scripts/patch-mcp-sdk-dialect.cjs
+new file mode 100644
+index 0000000..f4ed9d3
+--- /dev/null
++++ b/packages/cli/scripts/patch-mcp-sdk-dialect.cjs
+@@ -0,0 +1,67 @@
++#!/usr/bin/env node
++// Make @modelcontextprotocol/sdk advertise JSON Schema 2020-12 instead of draft-07.
++//
++// The SDK converts ktx's Zod v4 schemas for tools/list via toJsonSchemaCompat(),
++// whose mapMiniTarget() returns 'draft-7' when no target is passed — and mcp.js
++// never passes one. Zod then stamps draft-07 on every schema the server emits, and
++// clients validating with a 2020-12-only validator (Claude Code uses Ajv 2020)
++// reject the dialect and refuse to run the tool at all.
++// Upstream bug: https://github.com/modelcontextprotocol/typescript-sdk/issues/745
++// (still hardcoded in SDK 1.30.0, so bumping the SDK does not help).
++//
++// Flips only the "caller passed no target" branch, so an explicit 'draft-7'
++// request is still honoured. ktx's own code is untouched.
++//
++// Wired to postinstall so it survives reinstalls. Idempotent — re-run any time:
++//   node scripts/patch-mcp-sdk-dialect.cjs
++// Never fails an install: on any surprise it warns and exits 0.
++
++const fs = require('node:fs');
++const path = require('node:path');
++
++const FROM =
++    /(function mapMiniTarget\([^)]*\)\s*\{\s*if\s*\(\s*!\s*\w+\s*\)\s*(?:\r?\n)?\s*return\s+)(['"])draft-7\2/;
++const DONE =
++    /function mapMiniTarget\([^)]*\)\s*\{\s*if\s*\(\s*!\s*\w+\s*\)\s*(?:\r?\n)?\s*return\s+(['"])draft-2020-12\1/;
++
++function findSdk() {
++    const pkg = path.join(__dirname, '..'); // scripts/ sits at the package root
++    const candidates = [
++        path.join(pkg, 'node_modules', '@modelcontextprotocol', 'sdk'), // nested
++        path.join(pkg, '..', '@modelcontextprotocol', 'sdk'), // hoisted, unscoped pkg
++        path.join(pkg, '..', '..', '@modelcontextprotocol', 'sdk'), // hoisted, scoped pkg
++    ];
++    return candidates.find((dir) => fs.existsSync(path.join(dir, 'package.json'))) ?? null;
++}
++
++try {
++    const sdk = findSdk();
++    if (!sdk) {
++        throw new Error('@modelcontextprotocol/sdk not found');
++    }
++    const { version } = require(path.join(sdk, 'package.json'));
++
++    let patched = 0;
++    let already = 0;
++    for (const build of ['esm', 'cjs']) {
++        const file = path.join(sdk, 'dist', build, 'server', 'zod-json-schema-compat.js');
++        if (!fs.existsSync(file)) continue;
++        const src = fs.readFileSync(file, 'utf8');
++        if (DONE.test(src)) {
++            already += 1;
++        } else if (FROM.test(src)) {
++            fs.writeFileSync(file, src.replace(FROM, '$1$2draft-2020-12$2'), 'utf8');
++            patched += 1;
++        }
++    }
++
++    if (patched > 0) {
++        console.log(`[ktx] mcp-sdk ${version}: tool schemas now advertise JSON Schema 2020-12`);
++    } else if (already > 0) {
++        console.log(`[ktx] mcp-sdk ${version}: dialect patch already applied`);
++    } else {
++        console.warn(`[ktx] mcp-sdk ${version}: dialect patch did not match — upstream may have fixed #745`);
++    }
++} catch (err) {
++    console.warn(`[ktx] mcp-sdk dialect patch skipped: ${err.message}`);
++}
+diff --git a/packages/cli/src/connectors/postgres/connector.ts b/packages/cli/src/connectors/postgres/connector.ts
+index c2c0f6d..b5b8a4f 100644
+--- a/packages/cli/src/connectors/postgres/connector.ts
++++ b/packages/cli/src/connectors/postgres/connector.ts
+@@ -697,29 +697,37 @@ export class KtxPostgresScanConnector implements KtxScanConnector {
+     if (!primaryKeysResult.ok) {
+       snapshotWarnings.push(primaryKeysResult.warning);
+     }
++    // Foreign keys come from pg_catalog, not information_schema.
++    // information_schema.constraint_column_usage only exposes columns of tables
++    // OWNED BY a currently enabled role, so a fully-granted non-owner sees zero
++    // rows there and the join silently drops every foreign key -- while the
++    // primary-key query above, which never touches that view, still returns all
++    // of them. pg_catalog.pg_constraint has no ownership gate.
+     const foreignKeysResult = await tryConstraintQuery(
+       { schema, kind: 'foreign_key', isDeniedError },
+       () =>
+         this.queryRaw<PostgresForeignKeyRow>(
+           `
+       SELECT
+-        tc.table_name,
+-        kcu.column_name,
+-        ccu.table_schema AS foreign_table_schema,
+-        ccu.table_name AS foreign_table_name,
+-        ccu.column_name AS foreign_column_name,
+-        tc.constraint_name
+-      FROM information_schema.table_constraints AS tc
+-      JOIN information_schema.key_column_usage AS kcu
+-        ON tc.constraint_name = kcu.constraint_name
+-        AND tc.table_schema = kcu.table_schema
+-      JOIN information_schema.constraint_column_usage AS ccu
+-        ON ccu.constraint_name = tc.constraint_name
+-        AND ccu.table_schema = tc.table_schema
+-      WHERE tc.constraint_type = 'FOREIGN KEY'
+-        AND tc.table_schema = $1
+-        ${tableConstraintScopeClause}
+-      ORDER BY tc.table_name, kcu.column_name
++        c.relname AS table_name,
++        a.attname AS column_name,
++        fn.nspname AS foreign_table_schema,
++        fc.relname AS foreign_table_name,
++        fa.attname AS foreign_column_name,
++        con.conname AS constraint_name
++      FROM pg_catalog.pg_constraint con
++      JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
++      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
++      JOIN pg_catalog.pg_class fc ON fc.oid = con.confrelid
++      JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace
++      JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS ck(attnum, ord) ON true
++      JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS fk(attnum, ord) ON ck.ord = fk.ord
++      JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = ck.attnum
++      JOIN pg_catalog.pg_attribute fa ON fa.attrelid = fc.oid AND fa.attnum = fk.attnum
++      WHERE con.contype = 'f'
++        AND n.nspname = $1
++        ${pgCatalogScopeClause}
++      ORDER BY c.relname, con.conname, ck.ord
+       `,
+           [schema, ...scopeValues],
+         ),
+diff --git a/packages/cli/src/context/scan/enrichment-state.ts b/packages/cli/src/context/scan/enrichment-state.ts
+index 84b6224..3fbc3a4 100644
+--- a/packages/cli/src/context/scan/enrichment-state.ts
++++ b/packages/cli/src/context/scan/enrichment-state.ts
+@@ -1,6 +1,12 @@
+ import { stableContentHash } from '../cache/content-result-cache.js';
+ import type { KtxScanRelationshipConfig } from '../project/config.js';
+-import type { KtxScanEnrichmentStage, KtxScanEnrichmentStateSummary, KtxScanMode, KtxSchemaSnapshot } from './types.js';
++import type {
++  KtxScanEnrichmentStage,
++  KtxScanEnrichmentStateSummary,
++  KtxScanMode,
++  KtxSchemaSnapshot,
++  KtxSchemaTable,
++} from './types.js';
+ 
+ /**
+  * Canonical enrichment-stage registry. The `--stages` CLI parser validates
+@@ -99,13 +105,26 @@ export interface KtxRelationshipsStageHashInput {
+   llmIdentity: KtxScanLlmIdentity;
+ }
+ 
++/**
++ * [fix bug1] Schema-identifying view of a snapshot for the enrichment-stage
++ * hashes. Excludes `extractedAt` — a per-scan wall-clock timestamp set fresh on
++ * every introspection — so an unchanged schema keeps a stable hash across
++ * re-scans (the timestamp otherwise re-keys every stage and forces a full
++ * LLM re-generation). Mirrors `stableLiveDatabaseHashContent` in
++ * local-stage-ingest.ts, which already strips it for the ingest work-unit hash.
++ */
++function stableSnapshotHashInput(snapshot: KtxSchemaSnapshot): Omit<KtxSchemaSnapshot, 'extractedAt'> {
++  const { extractedAt: _extractedAt, ...stable } = snapshot;
++  return stable;
++}
++
+ export function computeKtxDescriptionsStageHash(input: KtxDescriptionsStageHashInput): string {
+-  return stableContentHash({ snapshot: input.snapshot, llmIdentity: input.llmIdentity });
++  return stableContentHash({ snapshot: stableSnapshotHashInput(input.snapshot), llmIdentity: input.llmIdentity });
+ }
+ 
+ export function computeKtxEmbeddingsStageHash(input: KtxEmbeddingsStageHashInput): string {
+   return stableContentHash({
+-    snapshot: input.snapshot,
++    snapshot: stableSnapshotHashInput(input.snapshot),
+     embeddingIdentity: input.embeddingIdentity,
+     descriptionDigest: input.descriptionDigest,
+   });
+@@ -113,12 +132,31 @@ export function computeKtxEmbeddingsStageHash(input: KtxEmbeddingsStageHashInput
+ 
+ export function computeKtxRelationshipsStageHash(input: KtxRelationshipsStageHashInput): string {
+   return stableContentHash({
+-    snapshot: input.snapshot,
++    snapshot: stableSnapshotHashInput(input.snapshot),
+     relationshipSettings: input.relationshipSettings,
+     llmIdentity: input.llmIdentity,
+   });
+ }
+ 
++/**
++ * [fix bug2] Per-table description cache key. A table's AI description depends
++ * only on that table's own structure and the description LLM identity — never on
++ * which other tables are in the batch. Keying resume per table (instead of
++ * gating the whole batch on {@link computeKtxDescriptionsStageHash}) lets an
++ * added/removed table reuse every unchanged table's description.
++ */
++export function computeKtxTableDescriptionHash(input: {
++  table: KtxSchemaTable;
++  llmIdentity: KtxScanLlmIdentity;
++}): string {
++  // [fix bug3] `estimatedRows` is a live row count that drifts on every scan of an
++  // active database. Including it re-keys unchanged tables and drops their
++  // descriptions — the same class of bug as `extractedAt` above. Hash only the
++  // structure a description actually depends on.
++  const { estimatedRows: _estimatedRows, ...stableTable } = input.table;
++  return stableContentHash({ table: stableTable, llmIdentity: input.llmIdentity });
++}
++
+ /**
+  * Content digest of the resolved per-column description text the embeddings
+  * stage consumes. Folding it into the embeddings hash content-addresses
+diff --git a/packages/cli/src/context/scan/local-enrichment-artifacts.ts b/packages/cli/src/context/scan/local-enrichment-artifacts.ts
+index fa18777..4488840 100644
+--- a/packages/cli/src/context/scan/local-enrichment-artifacts.ts
++++ b/packages/cli/src/context/scan/local-enrichment-artifacts.ts
+@@ -338,16 +338,25 @@ function descriptionsProgressPath(connectionId: string): string {
+ interface DescriptionsProgressRecord {
+   inputHash: string;
+   descriptions: LocalDescriptionUpdates;
++  /** [fix bug2] Per-table hash (structure + llmIdentity) keyed by tableRefKey. */
++  tableHashes?: Record<string, string>;
++}
++
++/** [fix bug2] Prior descriptions plus their per-table hashes; the caller recovers per table. */
++export interface KtxScanDescriptionResumeLoad {
++  descriptions: LocalDescriptionUpdates;
++  tableHashes: Record<string, string>;
+ }
+ 
+ export interface KtxScanDescriptionResumeStore {
+-  /** Prior enriched descriptions when the durable record matches `inputHash`, else null. */
+-  load(inputHash: string): Promise<LocalDescriptionUpdates | null>;
++  /** The whole prior record (descriptions + per-table hashes), or null when none exists. */
++  load(): Promise<KtxScanDescriptionResumeLoad | null>;
+   /** Persist the descriptions so far + the manifest shards that gained a table this batch. */
+   flush(input: {
+     inputHash: string;
+     snapshot: KtxSchemaSnapshot;
+     descriptionUpdates: LocalDescriptionUpdates;
++    tableHashes: Record<string, string>;
+     changedTableNames: ReadonlySet<string>;
+   }): Promise<void>;
+ }
+@@ -360,7 +369,7 @@ export function createKtxScanDescriptionResumeStore(deps: {
+ }): KtxScanDescriptionResumeStore {
+   const path = descriptionsProgressPath(deps.connectionId);
+   return {
+-    async load(inputHash) {
++    async load() {
+       let content: string;
+       try {
+         ({ content } = await deps.project.fileStore.readFile(path));
+@@ -369,18 +378,20 @@ export function createKtxScanDescriptionResumeStore(deps: {
+       }
+       try {
+         const record = JSON.parse(content) as DescriptionsProgressRecord | null;
+-        // A changed inputHash (schema or enrichment settings changed) ignores the
+-        // prior record and recomputes — spec-19's inputHash-gated resume semantics.
+-        if (!record || record.inputHash !== inputHash || !Array.isArray(record.descriptions)) {
++        // [fix bug2] Return the whole record + per-table hashes; the caller recovers
++        // each table whose own hash still matches (per-table resume), so an unrelated
++        // table change no longer discards the rest. A pre-fix record (no tableHashes)
++        // recovers nothing and safely recomputes.
++        if (!record || !Array.isArray(record.descriptions)) {
+           return null;
+         }
+-        return record.descriptions;
++        return { descriptions: record.descriptions, tableHashes: record.tableHashes ?? {} };
+       } catch {
+         return null;
+       }
+     },
+-    async flush({ inputHash, snapshot, descriptionUpdates, changedTableNames }) {
+-      const record: DescriptionsProgressRecord = { inputHash, descriptions: descriptionUpdates };
++    async flush({ inputHash, snapshot, descriptionUpdates, tableHashes, changedTableNames }) {
++      const record: DescriptionsProgressRecord = { inputHash, descriptions: descriptionUpdates, tableHashes };
+       await writeJsonArtifact(
+         deps.project,
+         path,
+diff --git a/packages/cli/src/context/scan/local-enrichment.ts b/packages/cli/src/context/scan/local-enrichment.ts
+index 8b4da12..0c878fb 100644
+--- a/packages/cli/src/context/scan/local-enrichment.ts
++++ b/packages/cli/src/context/scan/local-enrichment.ts
+@@ -10,6 +10,7 @@ import {
+   computeKtxEmbeddingsStageHash,
+   computeKtxRelationshipsStageHash,
+   computeKtxScanDescriptionDigest,
++  computeKtxTableDescriptionHash,
+   KTX_SCAN_ENRICHMENT_STAGES,
+   type KtxScanEmbeddingIdentity,
+   type KtxScanEnrichmentStateStore,
+@@ -352,6 +353,7 @@ async function generateDescriptions(input: {
+   context: KtxScanContext;
+   providers: KtxLocalScanEnrichmentProviders;
+   inputHash: string;
++  llmIdentity: KtxScanLlmIdentity;
+   resumeStore?: KtxScanDescriptionResumeStore | null;
+   progress?: KtxProgressPort;
+   warnings?: KtxScanWarning[];
+@@ -384,11 +386,26 @@ async function generateDescriptions(input: {
+   // Resume: recover already-enriched tables (inputHash-gated) and re-issue LLM
+   // calls only for the remainder. A failed/skipped table carries null descriptions
+   // and is not recovered, so it is retried.
+-  const recovered = input.resumeStore ? ((await input.resumeStore.load(input.inputHash)) ?? []) : [];
++  // [fix bug2] Recover per table: each table gated on its own hash (structure +
++  // llmIdentity), so adding/removing an unrelated table no longer discards the rest.
++  const currentTableHashes = new Map<string, string>();
++  for (const t of input.snapshot.tables) {
++    currentTableHashes.set(
++      tableRefKey(tableRef(t)),
++      computeKtxTableDescriptionHash({ table: t, llmIdentity: input.llmIdentity }),
++    );
++  }
++  const prior = input.resumeStore ? await input.resumeStore.load() : null;
++  const priorTableHashes = prior?.tableHashes ?? {};
+   const enrichedById = new Map<string, KtxScanDescriptionUpdate>();
+-  for (const update of recovered) {
+-    if (isEnrichedDescriptionUpdate(update)) {
+-      enrichedById.set(tableRefKey(update.table), update);
++  for (const update of prior?.descriptions ?? []) {
++    const key = tableRefKey(update.table);
++    if (
++      isEnrichedDescriptionUpdate(update) &&
++      priorTableHashes[key] !== undefined &&
++      priorTableHashes[key] === currentTableHashes.get(key)
++    ) {
++      enrichedById.set(key, update);
+     }
+   }
+   const remaining = input.snapshot.tables.filter((table) => !enrichedById.has(tableRefKey(tableRef(table))));
+@@ -418,6 +435,9 @@ async function generateDescriptions(input: {
+         inputHash: input.inputHash,
+         snapshot: input.snapshot,
+         descriptionUpdates: [...enrichedById.values()],
++        tableHashes: Object.fromEntries(
++          [...enrichedById.keys()].map((key) => [key, currentTableHashes.get(key) ?? '']),
++        ),
+         changedTableNames,
+       });
+     } finally {
+@@ -756,6 +776,7 @@ export async function runLocalScanEnrichment(
+             context: input.context,
+             providers,
+             inputHash: descriptionsHash,
++            llmIdentity,
+             resumeStore: input.descriptionResumeStore,
+             progress: descriptionProgress,
+             warnings,
+diff --git a/packages/cli/src/managed-local-embeddings.ts b/packages/cli/src/managed-local-embeddings.ts
+index 999b38c..ef14084 100644
+--- a/packages/cli/src/managed-local-embeddings.ts
++++ b/packages/cli/src/managed-local-embeddings.ts
+@@ -1,6 +1,6 @@
+ import type { KtxEmbeddingConfig } from './llm/types.js';
+ import type { KtxCliIo } from './cli-runtime.js';
+-import { createCliSpinner } from './clack.js';
++import { createStaticCliSpinner } from './clack.js';
+ import {
+   ensureManagedPythonCommandRuntime,
+   type KtxManagedPythonInstallPolicy,
+@@ -54,6 +54,22 @@ export function managedLocalEmbeddingHealthConfig(input: {
+   };
+ }
+ 
++/**
++ * [fix bug6] Belt and braces for the raw-mode leak above: whatever this function
++ * did to stdin, leave the terminal able to deliver Ctrl-C. Cheap and idempotent -
++ * a no-op when stdin is not a raw TTY.
++ */
++function restoreCookedStdin(): void {
++  const stdin = process.stdin as NodeJS.ReadStream & { isRaw?: boolean };
++  if (stdin.isTTY === true && stdin.isRaw === true && typeof stdin.setRawMode === 'function') {
++    try {
++      stdin.setRawMode(false);
++    } catch {
++      // Never let a terminal tidy-up break an ingest.
++    }
++  }
++}
++
+ export async function ensureManagedLocalEmbeddingsDaemon(
+   options: ManagedLocalEmbeddingsOptions,
+ ): Promise<ManagedLocalEmbeddingsDaemon> {
+@@ -66,7 +82,16 @@ export async function ensureManagedLocalEmbeddingsDaemon(
+     io: options.io,
+     feature: 'local-embeddings',
+   });
+-  const spinner = createCliSpinner(options.io);
++  // [fix bug6] Use the STATIC spinner, not the animated one. The animated clack
++  // spinner seizes stdin through `@clack/core`'s `block()`, which calls
++  // `readline.createInterface` -> `setRawMode(true)`, and stopping it never
++  // restores cooked mode. Because this runs early in every `ktx ingest` that uses
++  // the managed embeddings daemon, the console stayed raw for the whole run - and
++  // a raw console never translates a Ctrl-C keypress into SIGINT, so the ingest
++  // could not be interrupted at all, no matter how many times it was pressed.
++  // clack.ts already documents this hazard above `createStaticCliSpinner`; this
++  // call site simply used the wrong one.
++  const spinner = createStaticCliSpinner(options.io);
+   spinner.start('Starting ktx embedding daemon (first run downloads the model)…');
+   let daemon: ManagedPythonDaemonStartResult;
+   try {
+@@ -78,10 +103,12 @@ export async function ensureManagedLocalEmbeddingsDaemon(
+     });
+   } catch (error) {
+     spinner.error('ktx embedding daemon failed to start');
++    restoreCookedStdin();
+     throw error;
+   }
+   const verb = daemon.status === 'started' ? 'Started' : 'Using';
+   spinner.stop(`${verb} ktx daemon: ${daemon.baseUrl}`);
++  restoreCookedStdin();
+ 
+   return {
+     baseUrl: daemon.baseUrl,
+```
 
 ## License
 
