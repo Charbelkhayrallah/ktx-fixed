@@ -1,5 +1,5 @@
 diff --git a/packages/cli/package.json b/packages/cli/package.json
-index af4bf65..a931951 100644
+index af4bf65..97bbab8 100644
 --- a/packages/cli/package.json
 +++ b/packages/cli/package.json
 @@ -1,7 +1,7 @@
@@ -8,7 +8,7 @@ index af4bf65..a931951 100644
 -  "version": "0.16.0",
 -  "description": "Standalone ktx context layer for data agents",
 +  "name": "@charbelkh/ktx",
-+  "version": "0.16.4",
++  "version": "0.16.5",
 +  "description": "Patched fork of @kaelio/ktx 0.16.0 - ktx ingest reuses already-generated AI descriptions instead of regenerating them (upstream issues #347, #348)",
    "author": {
      "name": "Kaelio",
@@ -316,7 +316,7 @@ index fa18777..4488840 100644
          deps.project,
          path,
 diff --git a/packages/cli/src/context/scan/local-enrichment.ts b/packages/cli/src/context/scan/local-enrichment.ts
-index 8b4da12..0c878fb 100644
+index 8b4da12..f091a58 100644
 --- a/packages/cli/src/context/scan/local-enrichment.ts
 +++ b/packages/cli/src/context/scan/local-enrichment.ts
 @@ -10,6 +10,7 @@ import {
@@ -376,7 +376,49 @@ index 8b4da12..0c878fb 100644
          changedTableNames,
        });
      } finally {
-@@ -756,6 +776,7 @@ export async function runLocalScanEnrichment(
+@@ -590,6 +610,16 @@ async function runEnrichmentStage<TOutput>(input: {
+    * spec-20 per-table resume record.
+    */
+   forceRecompute?: boolean;
++  /**
++   * [fix bug6] Whether this run's output may be cached as a completed stage.
++   * A stage that finished but produced an incomplete result (e.g. descriptions
++   * the LLM never returned) must NOT be stored: findCompletedStage() would hand
++   * that gap back to every later run with a matching inputHash, which reports
++   * success and never retries. Returning false leaves no completed row, so the
++   * next run re-enters compute() and the per-table resume fills only the gaps.
++   * Omitted means always cacheable, preserving the previous behaviour.
++   */
++  cacheable?: (output: TOutput) => boolean;
+   compute: () => Promise<TOutput>;
+ }): Promise<TOutput> {
+   if (!input.forceRecompute) {
+@@ -598,7 +628,12 @@ async function runEnrichmentStage<TOutput>(input: {
+       stage: input.stage,
+       inputHash: input.inputHash,
+     });
+-    if (existing) {
++    // [fix bug6] A completed row whose payload is incomplete is treated as a miss.
++    // Rows written before this fix (or by another machine) still carry gaps; without
++    // this the short-circuit would keep handing them back forever and no re-run could
++    // ever heal them. Falling through recomputes, and the write guard below stops the
++    // gap being cached again.
++    if (existing && (input.cacheable?.(existing.output) ?? true)) {
+       input.resumedStages.push(input.stage);
+       input.completedStages.push(input.stage);
+       return existing.output;
+@@ -608,6 +643,10 @@ async function runEnrichmentStage<TOutput>(input: {
+   try {
+     const output = await input.compute();
+     input.completedStages.push(input.stage);
++    // [fix bug6] Only cache a result that is actually complete.
++    if (input.cacheable && !input.cacheable(output)) {
++      return output;
++    }
+     await input.stateStore?.saveCompletedStage({
+       runId: input.runId,
+       connectionId: input.connectionId,
+@@ -756,12 +795,30 @@ export async function runLocalScanEnrichment(
              context: input.context,
              providers,
              inputHash: descriptionsHash,
@@ -384,6 +426,42 @@ index 8b4da12..0c878fb 100644
              resumeStore: input.descriptionResumeStore,
              progress: descriptionProgress,
              warnings,
+           }),
++        // [fix bug6] Never cache a descriptions result that still has gaps.
++        cacheable: (output) => output.every((update) => isEnrichedDescriptionUpdate(update)),
+       });
+       descriptionsRanThisInvocation = true;
++      // [fix bug6] Surface the gap. Without this the run prints a clean tick while
++      // tables sit undescribed, and nothing in warnings.json records it either:
++      // tables that were never attempted raise no `enrichment_failed` of their own.
++      const undescribed = descriptions.filter((update) => !isEnrichedDescriptionUpdate(update)).length;
++      if (undescribed > 0) {
++        warnings.push({
++          code: 'descriptions_incomplete',
++          message:
++            `${undescribed} of ${descriptions.length} tables have no AI description. ` +
++            'This result was not cached, so re-running `ktx ingest` once the LLM is ' +
++            'available will describe only those tables.',
++          recoverable: true,
++          metadata: { undescribed, total: descriptions.length },
++        });
++      }
+       summary.dataDictionary = input.connector.sampleColumn ? 'completed' : 'skipped';
+       summary.tableDescriptions = 'completed';
+       summary.columnDescriptions = 'completed';
+diff --git a/packages/cli/src/context/scan/types.ts b/packages/cli/src/context/scan/types.ts
+index bf72558..ff498ff 100644
+--- a/packages/cli/src/context/scan/types.ts
++++ b/packages/cli/src/context/scan/types.ts
+@@ -382,6 +382,8 @@ interface KtxScanArtifactPaths {
+ }
+ 
+ type KtxScanWarningCode =
++  /** [fix bug6] The descriptions stage finished with tables still undescribed. */
++  | 'descriptions_incomplete'
+   | 'connector_capability_missing'
+   | 'sampling_failed'
+   | 'statistics_failed'
 diff --git a/packages/cli/src/managed-local-embeddings.ts b/packages/cli/src/managed-local-embeddings.ts
 index 999b38c..ef14084 100644
 --- a/packages/cli/src/managed-local-embeddings.ts
@@ -450,3 +528,118 @@ index 999b38c..ef14084 100644
  
    return {
      baseUrl: daemon.baseUrl,
+diff --git a/packages/cli/test/context/scan/local-enrichment.test.ts b/packages/cli/test/context/scan/local-enrichment.test.ts
+index 61cdbcb..bce2acb 100644
+--- a/packages/cli/test/context/scan/local-enrichment.test.ts
++++ b/packages/cli/test/context/scan/local-enrichment.test.ts
+@@ -10,12 +10,15 @@ import {
+   loadOnDiskDescriptionUpdates,
+   writeLocalScanEnrichmentArtifacts,
+ } from '../../../src/context/scan/local-enrichment-artifacts.js';
+-import type {
+-  KtxScanEnrichmentCompletedStage,
+-  KtxScanEnrichmentFailedStage,
+-  KtxScanEnrichmentStageLookup,
+-  KtxScanEnrichmentStateStore,
++import {
++  computeKtxTableDescriptionHash,
++  type KtxScanEnrichmentCompletedStage,
++  type KtxScanEnrichmentFailedStage,
++  type KtxScanEnrichmentStageLookup,
++  type KtxScanEnrichmentStateStore,
++  type KtxScanLlmIdentity,
+ } from '../../../src/context/scan/enrichment-state.js';
++import { tableRefKey } from '../../../src/context/scan/table-ref.js';
+ import {
+   createDeterministicLocalScanEnrichmentProviders,
+   runLocalScanEnrichment,
+@@ -29,8 +32,34 @@ import {
+   type KtxScanConnector,
+   type KtxScanContext,
+   type KtxSchemaSnapshot,
++  type KtxSchemaTable,
+ } from '../../../src/context/scan/types.js';
+ 
++/**
++ * Build a description-resume record in the store's shape: the prior descriptions
++ * plus the per-table hash each one is gated on. The hash must be computed with the
++ * same function and the same llmIdentity the run uses, otherwise the table is not
++ * recovered and the run re-enriches it.
++ */
++function resumeRecord(
++  updates: { table: { catalog: string | null; db: string; name: string }; tableDescription: string; columnDescriptions: Record<string, string> }[],
++  tables: readonly KtxSchemaTable[],
++  llmIdentity: KtxScanLlmIdentity,
++) {
++  return {
++    descriptions: updates,
++    tableHashes: Object.fromEntries(
++      updates.map((update) => {
++        const table = tables.find((entry) => entry.name === update.table.name && entry.db === update.table.db);
++        if (!table) {
++          throw new Error(`resumeRecord: no table ${update.table.db}.${update.table.name} in the snapshot`);
++        }
++        return [tableRefKey(update.table), computeKtxTableDescriptionHash({ table, llmIdentity })];
++      }),
++    ),
++  };
++}
++
+ function fakeScanEmbedding(options: { dimensions: number; maxBatchSize?: number }): KtxEmbeddingPort {
+   return {
+     dimensions: options.dimensions,
+@@ -1404,13 +1433,19 @@ describe('local scan enrichment', () => {
+     const providers = createDeterministicLocalScanEnrichmentProviders();
+     const identity = { llmIdentity: { model: 'fake', baseUrlConfigured: false } };
+     const resumeStore = {
+-      load: vi.fn(async () => [
+-        {
+-          table: { catalog: null, db: 'public', name: 'customers' },
+-          tableDescription: 'Recovered customers description',
+-          columnDescriptions: { id: 'Recovered id' },
+-        },
+-      ]),
++      load: vi.fn(async () =>
++        resumeRecord(
++          [
++            {
++              table: { catalog: null, db: 'public', name: 'customers' },
++              tableDescription: 'Recovered customers description',
++              columnDescriptions: { id: 'Recovered id' },
++            },
++          ],
++          snapshot.tables,
++          identity.llmIdentity,
++        ),
++      ),
+       flush: vi.fn(async () => {}),
+     };
+ 
+@@ -1485,13 +1520,20 @@ describe('local scan enrichment', () => {
+     const generateObject = vi.spyOn(providers.llmRuntime, 'generateObject');
+     // Only the analytics.orders description was flushed before the interruption.
+     const resumeStore = {
+-      load: vi.fn(async () => [
+-        {
+-          table: { catalog: null, db: 'analytics', name: 'orders' },
+-          tableDescription: 'Recovered analytics orders',
+-          columnDescriptions: { id: 'Recovered analytics id' },
+-        },
+-      ]),
++      load: vi.fn(async () =>
++        resumeRecord(
++          [
++            {
++              table: { catalog: null, db: 'analytics', name: 'orders' },
++              tableDescription: 'Recovered analytics orders',
++              columnDescriptions: { id: 'Recovered analytics id' },
++            },
++          ],
++          multiSchemaSnapshot.tables,
++          // runLocalScanEnrichment defaults to this when no llmIdentity is passed.
++          { model: null, baseUrlConfigured: false },
++        ),
++      ),
+       flush: vi.fn(async () => {}),
+     };
+ 

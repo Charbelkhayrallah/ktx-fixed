@@ -1,7 +1,7 @@
 # ktx-fixed
 
 An unofficial patched build of [`@kaelio/ktx`](https://github.com/Kaelio/ktx)
-**v0.16.0**, published as **`@charbelkh/ktx` 0.16.4**. Five fixes, all in this
+**v0.16.0**, published as **`@charbelkh/ktx` 0.16.5**. Six fixes, all in this
 repo as a single patch you can apply to a pristine upstream checkout.
 
 Not affiliated with or endorsed by Kaelio. Apache-2.0, same as upstream.
@@ -13,6 +13,7 @@ Not affiliated with or endorsed by Kaelio. Apache-2.0, same as upstream.
 | 3 | Every ktx MCP tool fails in Claude Code before it runs | Make the MCP SDK advertise JSON Schema 2020-12 |
 | 4 | Ctrl-C cannot stop an ingest | Stop leaking the terminal into raw mode |
 | 5 | Postgres foreign keys all missing, silently, unless you own the tables | Read them from `pg_catalog` instead of `information_schema` |
+| 6 | A run that ends with descriptions missing caches the gap as "complete", so every later `ktx ingest` reports success in seconds and never retries | Never cache an incomplete descriptions stage, and ignore one already cached |
 
 ### What is in this repo
 
@@ -30,7 +31,7 @@ npm uninstall -g @kaelio/ktx
 npm i -g https://raw.githubusercontent.com/Charbelkhayrallah/ktx-fixed/main/ktx-fixed.tgz
 ```
 
-Check it worked — should print `@charbelkh/ktx 0.16.4`:
+Check it worked — should print `@charbelkh/ktx 0.16.5`:
 
 ```bash
 ktx --version
@@ -71,17 +72,19 @@ The difference is what happens on a **re-run**:
 | Ctrl-C mid-ingest, then re-run | Starts over | Keeps finished tables |
 | Adding one table | Re-runs all of them | Runs only the new one |
 
-**Rare exception.** A plain re-run normally *does* retry descriptions an LLM
-rate limit left empty — the per-table resume above handles it, and on an active
-database the stage hash drifts anyway, so the stage re-enters and fills only the
-gaps. It fails to only when the descriptions stage was recorded complete under a
-byte-identical stage hash, which needs the schema, every table's row-count
-estimate, and the LLM identity all unchanged since that run. If a re-run makes no
-LLM calls and descriptions are still missing, force the stage:
+**Descriptions an LLM rate limit left empty are always retried.** Change 2
+recovers the tables already described, and change 6 makes sure a run that ended
+with gaps is never cached as complete — and that a gap cached by an earlier build
+is ignored rather than replayed. So a plain re-run fills them:
 
 ```bash
-ktx ingest <connection-id> --stages descriptions
+ktx ingest <connection-id>
 ```
+
+Up to 0.16.4 this was not reliable: a run that *finished* with tables still
+undescribed stored that gap as a completed stage, and every later run handed it
+back in seconds with a clean tick. `--stages descriptions` was the workaround. It
+still forces a recompute if you want one, but should no longer be necessary.
 
 That keeps the good descriptions and regenerates only the empty ones.
 
@@ -237,6 +240,52 @@ Not yet reported upstream — worth doing, since it silently degrades every
 Postgres project whose ktx account is not the table owner, which is the normal
 setup for a read-only analytics user.
 
+### 6. A descriptions stage that finished with gaps is no longer cached as complete
+
+`connectors/../context/scan/local-enrichment.ts`, `types.ts`.
+
+A run that ended with tables still undescribed — an LLM rate limit, a dropped
+database connection, anything that leaves nulls — stored that result as a
+**completed** stage keyed on the stage hash. Every later `ktx ingest` whose hash
+matched found the completed row, handed the gap straight back, finished in
+seconds and printed a clean tick. The gap became permanent, and nothing said so:
+tables that were never attempted raise no `enrichment_failed` of their own, so
+`warnings.json` stayed empty too.
+
+Observed on a 349-table project. Two rows cached as `status=completed`, each
+carrying `217/349` descriptions and 132 nulls; the scan report showed
+`resumedStages: ["descriptions", ...]`, which is pushed only in the
+short-circuit branch. A plain `ktx ingest` took 13 seconds and reported success
+with 132 descriptions still missing. `--stages descriptions` was the only escape.
+
+The stage runner now takes an optional `cacheable(output)` predicate, applied on
+**both** sides:
+
+- **write** — a result that fails the predicate is returned but never stored, so
+  a gap cannot be cached in the first place;
+- **read** — a completed row that fails the predicate is treated as a miss, so
+  rows written before this fix (or by another machine) stop being replayed and
+  the project heals itself on the next run rather than needing a manual flag.
+
+For descriptions the predicate is
+`output.every((update) => isEnrichedDescriptionUpdate(update))`. Because
+`generateDescriptions` returns the full table set in snapshot order — recovered,
+freshly enriched, or `nullDescriptionUpdate` for anything still missing — a
+single gap fails it. The stage then re-enters `compute()`, change 2's per-table
+resume recovers everything already described, and only the missing tables reach
+the LLM.
+
+A `descriptions_incomplete` warning now names the count, so an incomplete run is
+visible in `warnings.json` instead of silent.
+
+> **Consequence worth knowing.** While any table is undescribed, the descriptions
+> stage is not cacheable, so every run re-enters it. That costs one cheap
+> re-entry, not re-generation — the per-table hashes mean only the missing tables
+> are sent. A table that can never be described keeps the stage uncacheable
+> indefinitely; the `descriptions_incomplete` warning tells you which.
+
+Not reported upstream yet.
+
 ## Known limitation: pin Claude Code to 2.1.233
 
 Not fixed by this build. ktx 0.16.x asserts that only its own known built-in
@@ -361,7 +410,7 @@ to a relative path first, or pass `--force-local`.
 npm pack
 ```
 
-Produces `charbelkh-ktx-0.16.4.tgz`. Rename to `ktx-fixed.tgz` and commit it
+Produces `charbelkh-ktx-0.16.5.tgz`. Rename to `ktx-fixed.tgz` and commit it
 here; the install command at the top of this README keeps working unchanged.
 
 ### Verify the rebuild
@@ -370,10 +419,10 @@ Run these against the tarball you just produced. All must pass:
 
 ```bash
 T=ktx-fixed.tgz
-tar -tzf $T | wc -l                                    # 1212
+tar -tzf $T | wc -l                                    # 1212 (1213 = see below)
 tar -tzf $T | grep -c 'assets/python'                  # 2
 tar -tzf $T | grep -c 'scripts/patch-mcp-sdk-dialect'  # 1
-tar -xzOf $T package/package.json | grep '"version"'   # 0.16.4
+tar -xzOf $T package/package.json | grep '"version"'   # 0.16.5
 
 # one grep per fix, against the compiled output
 tar -xzOf $T package/dist/context/scan/enrichment-state.js            | grep -c stableSnapshotHashInput        # >0  fix 1
@@ -384,12 +433,16 @@ tar -xzOf $T package/dist/managed-local-embeddings.js                 | grep -c 
 tar -xzOf $T package/dist/connectors/postgres/connector.js            | grep -c pg_catalog.pg_constraint       # >0  fix 5
 ```
 
+A count of **1213** means `pnpm run type-check` ran before packing: it writes
+`dist/.tsbuildinfo.test`, and `files: ["dist", "assets"]` sweeps it in. Delete
+that file and pack again.
+
 Then install it and confirm the version:
 
 ```bash
 npm uninstall -g @kaelio/ktx @charbelkh/ktx
 npm i -g ./ktx-fixed.tgz
-ktx --version                                          # @charbelkh/ktx 0.16.4
+ktx --version                                          # @charbelkh/ktx 0.16.5
 ktx admin runtime install --feature local-embeddings --yes
 ```
 
@@ -399,7 +452,7 @@ until you run that last command again.
 
 ### Porting to a newer upstream release
 
-Apply the patch to that tag instead. All five changes are small and localised; if
+Apply the patch to that tag instead. All six changes are small and localised; if
 a hunk stops applying, the numbered sections above say what each one has to
 accomplish, in enough detail to redo it by hand.
 
@@ -413,17 +466,27 @@ Against a pristine `git clone` of upstream at tag `v0.16.0` (commit `a6dd8cf`):
   `packages/cli/scripts/patch-mcp-sdk-dialect.cjs` is byte-identical to the
   shipped copy. (Line endings and a byte-order mark may differ — the shipped
   copies were written on Windows. No content differs.)
-- The shipped `dist/` carries all five fixes: `stableSnapshotHashInput` and
+- The shipped `dist/` carries all six fixes: `stableSnapshotHashInput` and
   `computeKtxTableDescriptionHash` in `dist/context/scan/enrichment-state.js`,
   `tableHashes` in `dist/context/scan/local-enrichment-artifacts.js`,
   `restoreCookedStdin` and `createStaticCliSpinner` in
-  `dist/managed-local-embeddings.js`, `pg_catalog.pg_constraint` in
+  `dist/managed-local-embeddings.js`, `cacheable` in
+  `dist/context/scan/local-enrichment.js`, `pg_catalog.pg_constraint` in
   `dist/connectors/postgres/connector.js`, and `scripts/patch-mcp-sdk-dialect.cjs`
   in the package.
 - Fix 5 was exercised end to end against a live 307-table Fineract schema with
   531 declared foreign keys, connecting as a non-owner: `foreign-keys.json` went
   from `{"foreignKeys": []}` to 531 entries, `warnings.json` stayed empty, and
   primary keys were 299/299 before and after.
+- Fix 6's read side was exercised against a real project holding three cached
+  `scan:descriptions` rows with gaps (`217/349` twice, `348/349` once). Before,
+  a plain `ktx ingest` short-circuited in 13 seconds; after, it rejected all
+  three rows, re-entered the stage, recovered 217 by per-table hash and resumed
+  generation at table 218. The write side follows from the same predicate.
+- `pnpm run type-check` passes on a fresh apply — both `tsconfig.json` and
+  `tsconfig.test.json`. Builds up to 0.16.4 failed the test half: change 2
+  altered the `load()` return type without updating the two resume-store mocks
+  in `local-enrichment.test.ts`, which this patch now repairs.
 
 ## This is temporary
 
@@ -450,17 +513,19 @@ rebuild the package.
 To use it, copy the contents of the fenced block into a file named
 `ktx-fixes.diff` and follow [Rebuild from source](#rebuild-from-source). It
 applies to a pristine upstream checkout at tag `v0.16.0` (commit `a6dd8cf`) and
-touches seven files:
+touches nine files:
 
-| File | Fix |
+| File | Change |
 |---|---|
 | `packages/cli/package.json` | 3 — name, version, `files`, `postinstall`, drop `publishConfig.provenance` |
 | `packages/cli/scripts/patch-mcp-sdk-dialect.cjs` *(new)* | 3 |
 | `packages/cli/src/context/scan/enrichment-state.ts` | 1 |
 | `packages/cli/src/context/scan/local-enrichment-artifacts.ts` | 2 |
-| `packages/cli/src/context/scan/local-enrichment.ts` | 2 |
+| `packages/cli/src/context/scan/local-enrichment.ts` | 2, 6 |
+| `packages/cli/src/context/scan/types.ts` | 6 — the `descriptions_incomplete` warning code |
 | `packages/cli/src/managed-local-embeddings.ts` | 4 |
 | `packages/cli/src/connectors/postgres/connector.ts` | 5 |
+| `packages/cli/test/context/scan/local-enrichment.test.ts` | 2 — repairs the two resume-store mocks change 2 left type-broken |
 
 If you edit one copy, regenerate the other — `git diff > ktx-fixes.diff` from the
 patched checkout, having first `git add -N` the new script so it is included.
@@ -472,7 +537,7 @@ diff <(sed -n '/^```diff$/,/^```$/p' README.md | sed '1d;$d') ktx-fixes.diff
 
 ```diff
 diff --git a/packages/cli/package.json b/packages/cli/package.json
-index af4bf65..a931951 100644
+index af4bf65..97bbab8 100644
 --- a/packages/cli/package.json
 +++ b/packages/cli/package.json
 @@ -1,7 +1,7 @@
@@ -481,7 +546,7 @@ index af4bf65..a931951 100644
 -  "version": "0.16.0",
 -  "description": "Standalone ktx context layer for data agents",
 +  "name": "@charbelkh/ktx",
-+  "version": "0.16.4",
++  "version": "0.16.5",
 +  "description": "Patched fork of @kaelio/ktx 0.16.0 - ktx ingest reuses already-generated AI descriptions instead of regenerating them (upstream issues #347, #348)",
    "author": {
      "name": "Kaelio",
@@ -789,7 +854,7 @@ index fa18777..4488840 100644
          deps.project,
          path,
 diff --git a/packages/cli/src/context/scan/local-enrichment.ts b/packages/cli/src/context/scan/local-enrichment.ts
-index 8b4da12..0c878fb 100644
+index 8b4da12..f091a58 100644
 --- a/packages/cli/src/context/scan/local-enrichment.ts
 +++ b/packages/cli/src/context/scan/local-enrichment.ts
 @@ -10,6 +10,7 @@ import {
@@ -849,7 +914,49 @@ index 8b4da12..0c878fb 100644
          changedTableNames,
        });
      } finally {
-@@ -756,6 +776,7 @@ export async function runLocalScanEnrichment(
+@@ -590,6 +610,16 @@ async function runEnrichmentStage<TOutput>(input: {
+    * spec-20 per-table resume record.
+    */
+   forceRecompute?: boolean;
++  /**
++   * [fix bug6] Whether this run's output may be cached as a completed stage.
++   * A stage that finished but produced an incomplete result (e.g. descriptions
++   * the LLM never returned) must NOT be stored: findCompletedStage() would hand
++   * that gap back to every later run with a matching inputHash, which reports
++   * success and never retries. Returning false leaves no completed row, so the
++   * next run re-enters compute() and the per-table resume fills only the gaps.
++   * Omitted means always cacheable, preserving the previous behaviour.
++   */
++  cacheable?: (output: TOutput) => boolean;
+   compute: () => Promise<TOutput>;
+ }): Promise<TOutput> {
+   if (!input.forceRecompute) {
+@@ -598,7 +628,12 @@ async function runEnrichmentStage<TOutput>(input: {
+       stage: input.stage,
+       inputHash: input.inputHash,
+     });
+-    if (existing) {
++    // [fix bug6] A completed row whose payload is incomplete is treated as a miss.
++    // Rows written before this fix (or by another machine) still carry gaps; without
++    // this the short-circuit would keep handing them back forever and no re-run could
++    // ever heal them. Falling through recomputes, and the write guard below stops the
++    // gap being cached again.
++    if (existing && (input.cacheable?.(existing.output) ?? true)) {
+       input.resumedStages.push(input.stage);
+       input.completedStages.push(input.stage);
+       return existing.output;
+@@ -608,6 +643,10 @@ async function runEnrichmentStage<TOutput>(input: {
+   try {
+     const output = await input.compute();
+     input.completedStages.push(input.stage);
++    // [fix bug6] Only cache a result that is actually complete.
++    if (input.cacheable && !input.cacheable(output)) {
++      return output;
++    }
+     await input.stateStore?.saveCompletedStage({
+       runId: input.runId,
+       connectionId: input.connectionId,
+@@ -756,12 +795,30 @@ export async function runLocalScanEnrichment(
              context: input.context,
              providers,
              inputHash: descriptionsHash,
@@ -857,6 +964,42 @@ index 8b4da12..0c878fb 100644
              resumeStore: input.descriptionResumeStore,
              progress: descriptionProgress,
              warnings,
+           }),
++        // [fix bug6] Never cache a descriptions result that still has gaps.
++        cacheable: (output) => output.every((update) => isEnrichedDescriptionUpdate(update)),
+       });
+       descriptionsRanThisInvocation = true;
++      // [fix bug6] Surface the gap. Without this the run prints a clean tick while
++      // tables sit undescribed, and nothing in warnings.json records it either:
++      // tables that were never attempted raise no `enrichment_failed` of their own.
++      const undescribed = descriptions.filter((update) => !isEnrichedDescriptionUpdate(update)).length;
++      if (undescribed > 0) {
++        warnings.push({
++          code: 'descriptions_incomplete',
++          message:
++            `${undescribed} of ${descriptions.length} tables have no AI description. ` +
++            'This result was not cached, so re-running `ktx ingest` once the LLM is ' +
++            'available will describe only those tables.',
++          recoverable: true,
++          metadata: { undescribed, total: descriptions.length },
++        });
++      }
+       summary.dataDictionary = input.connector.sampleColumn ? 'completed' : 'skipped';
+       summary.tableDescriptions = 'completed';
+       summary.columnDescriptions = 'completed';
+diff --git a/packages/cli/src/context/scan/types.ts b/packages/cli/src/context/scan/types.ts
+index bf72558..ff498ff 100644
+--- a/packages/cli/src/context/scan/types.ts
++++ b/packages/cli/src/context/scan/types.ts
+@@ -382,6 +382,8 @@ interface KtxScanArtifactPaths {
+ }
+ 
+ type KtxScanWarningCode =
++  /** [fix bug6] The descriptions stage finished with tables still undescribed. */
++  | 'descriptions_incomplete'
+   | 'connector_capability_missing'
+   | 'sampling_failed'
+   | 'statistics_failed'
 diff --git a/packages/cli/src/managed-local-embeddings.ts b/packages/cli/src/managed-local-embeddings.ts
 index 999b38c..ef14084 100644
 --- a/packages/cli/src/managed-local-embeddings.ts
@@ -923,6 +1066,121 @@ index 999b38c..ef14084 100644
  
    return {
      baseUrl: daemon.baseUrl,
+diff --git a/packages/cli/test/context/scan/local-enrichment.test.ts b/packages/cli/test/context/scan/local-enrichment.test.ts
+index 61cdbcb..bce2acb 100644
+--- a/packages/cli/test/context/scan/local-enrichment.test.ts
++++ b/packages/cli/test/context/scan/local-enrichment.test.ts
+@@ -10,12 +10,15 @@ import {
+   loadOnDiskDescriptionUpdates,
+   writeLocalScanEnrichmentArtifacts,
+ } from '../../../src/context/scan/local-enrichment-artifacts.js';
+-import type {
+-  KtxScanEnrichmentCompletedStage,
+-  KtxScanEnrichmentFailedStage,
+-  KtxScanEnrichmentStageLookup,
+-  KtxScanEnrichmentStateStore,
++import {
++  computeKtxTableDescriptionHash,
++  type KtxScanEnrichmentCompletedStage,
++  type KtxScanEnrichmentFailedStage,
++  type KtxScanEnrichmentStageLookup,
++  type KtxScanEnrichmentStateStore,
++  type KtxScanLlmIdentity,
+ } from '../../../src/context/scan/enrichment-state.js';
++import { tableRefKey } from '../../../src/context/scan/table-ref.js';
+ import {
+   createDeterministicLocalScanEnrichmentProviders,
+   runLocalScanEnrichment,
+@@ -29,8 +32,34 @@ import {
+   type KtxScanConnector,
+   type KtxScanContext,
+   type KtxSchemaSnapshot,
++  type KtxSchemaTable,
+ } from '../../../src/context/scan/types.js';
+ 
++/**
++ * Build a description-resume record in the store's shape: the prior descriptions
++ * plus the per-table hash each one is gated on. The hash must be computed with the
++ * same function and the same llmIdentity the run uses, otherwise the table is not
++ * recovered and the run re-enriches it.
++ */
++function resumeRecord(
++  updates: { table: { catalog: string | null; db: string; name: string }; tableDescription: string; columnDescriptions: Record<string, string> }[],
++  tables: readonly KtxSchemaTable[],
++  llmIdentity: KtxScanLlmIdentity,
++) {
++  return {
++    descriptions: updates,
++    tableHashes: Object.fromEntries(
++      updates.map((update) => {
++        const table = tables.find((entry) => entry.name === update.table.name && entry.db === update.table.db);
++        if (!table) {
++          throw new Error(`resumeRecord: no table ${update.table.db}.${update.table.name} in the snapshot`);
++        }
++        return [tableRefKey(update.table), computeKtxTableDescriptionHash({ table, llmIdentity })];
++      }),
++    ),
++  };
++}
++
+ function fakeScanEmbedding(options: { dimensions: number; maxBatchSize?: number }): KtxEmbeddingPort {
+   return {
+     dimensions: options.dimensions,
+@@ -1404,13 +1433,19 @@ describe('local scan enrichment', () => {
+     const providers = createDeterministicLocalScanEnrichmentProviders();
+     const identity = { llmIdentity: { model: 'fake', baseUrlConfigured: false } };
+     const resumeStore = {
+-      load: vi.fn(async () => [
+-        {
+-          table: { catalog: null, db: 'public', name: 'customers' },
+-          tableDescription: 'Recovered customers description',
+-          columnDescriptions: { id: 'Recovered id' },
+-        },
+-      ]),
++      load: vi.fn(async () =>
++        resumeRecord(
++          [
++            {
++              table: { catalog: null, db: 'public', name: 'customers' },
++              tableDescription: 'Recovered customers description',
++              columnDescriptions: { id: 'Recovered id' },
++            },
++          ],
++          snapshot.tables,
++          identity.llmIdentity,
++        ),
++      ),
+       flush: vi.fn(async () => {}),
+     };
+ 
+@@ -1485,13 +1520,20 @@ describe('local scan enrichment', () => {
+     const generateObject = vi.spyOn(providers.llmRuntime, 'generateObject');
+     // Only the analytics.orders description was flushed before the interruption.
+     const resumeStore = {
+-      load: vi.fn(async () => [
+-        {
+-          table: { catalog: null, db: 'analytics', name: 'orders' },
+-          tableDescription: 'Recovered analytics orders',
+-          columnDescriptions: { id: 'Recovered analytics id' },
+-        },
+-      ]),
++      load: vi.fn(async () =>
++        resumeRecord(
++          [
++            {
++              table: { catalog: null, db: 'analytics', name: 'orders' },
++              tableDescription: 'Recovered analytics orders',
++              columnDescriptions: { id: 'Recovered analytics id' },
++            },
++          ],
++          multiSchemaSnapshot.tables,
++          // runLocalScanEnrichment defaults to this when no llmIdentity is passed.
++          { model: null, baseUrlConfigured: false },
++        ),
++      ),
+       flush: vi.fn(async () => {}),
+     };
+ 
 ```
 
 ## License
